@@ -39,6 +39,7 @@ class Lab2(object):
     BUF_SZ = 1024
     ASSUME_FAILURE_TIMEOUT = 10
     days_to_birthday = 0
+    election_in_progress = False
     
     def __init__(self, gcd_address, nextBirthday, SUID) -> None:
         """Constructs a Lab2 object to talk to the given GCD """
@@ -54,6 +55,7 @@ class Lab2(object):
     def run(self):
         #Registering the socket without a callback for this socket
         self.selector.register(self.listener, selectors.EVENT_READ, data=None)
+        
 
         #Talk to the GCD
         self.join_group()
@@ -76,6 +78,9 @@ class Lab2(object):
             self.check_timeouts()
 
     def check_timeouts(self):
+        pass
+
+    def check_tout(self):
         #If state == WAITING FOR VICTOR -> check if nobody sent a COORDINATOR message
         #If so, then restart election
         #If state == None + all timed out -> declare victorious
@@ -177,8 +182,7 @@ class Lab2(object):
 
     def set_state(self, state, peer, switch_mode=False):
         #Set the state with a time stamp
-        print('Time stamp: {}'.format(self.stamp()))
-        self.states[peer] = (state, self.stamp())
+        self.states[peer] = [state, self.stamp()]
         print(self.states[peer])
 
         #Register the new connection with the selector also
@@ -205,7 +209,9 @@ class Lab2(object):
     > During wait time, the node state will in election-in-progress
     """
     def start_election(self):
+        print('\n--------Starting a new election')
         self.bully = None   #Voting in progress
+        self.election_in_progress = True
 
         #Must resolve which peers are of higher pid
         for m in self.members:
@@ -213,7 +219,7 @@ class Lab2(object):
                 #get the connection on a separate socket, then a write event will trigger send msg
                 s = self.get_connection(self.members[m])
                 #Set pending message
-                if s: self.states[s] = State.SEND_ELECTION
+                if s: self.set_state(State.SEND_ELECTION, s)
 
         print('I finished sending messages')
         #set a timeout, then declare victory if nobody replies
@@ -233,8 +239,9 @@ class Lab2(object):
 
     def send_msg(self, peer):
         #Attempt to send the message pending for this peer
-        print('Sending message to member: {}, msg: {}'.format(peer, self.states[peer]))
-        msg, time = self.states[peer]
+        
+        msg = self.states[peer][0]
+        print('Sending message to member: {}, msg: {}'.format(peer.getpeername(), msg.value))
 
         try:
             #if msg == State.SEND_OK:
@@ -244,10 +251,11 @@ class Lab2(object):
             data = pickle.dumps((msg.value, self.members))
             peer.sendall(data)
         except Exception as err:
-            print('Failure occured while trying to send message to peer') 
+            print('Failure occured while trying to send message to peer', err) 
         else:
             if msg == State.SEND_ELECTION: 
                 self.set_state(State.WAITING_FOR_OK, peer)
+                print('Setting port: {} to reading event'.format(peer.getsockname()))
                 self.selector.modify(peer, selectors.EVENT_READ)
             if msg == State.SEND_OK: self.set_state(State.WAITING_FOR_VICTOR, self.listener)
             if msg == State.SEND_VICTORY: self.set_state(State.QUIESCENT, peer)
@@ -258,21 +266,26 @@ class Lab2(object):
                 peer.close()
 
     def receive_msg(self, peer):
-        print('Trying to receive message')
+        
         try:
             data = peer.recv(BUF_SZ)
             msg = pickle.loads(data)
-            print(msg)
+            print('Trying to receive message: {}\n'.format(msg))
+            #print(msg)
         except Exception as err:
             print('Failure accepting data from peer: {}'.format(err))
         else:
             #update members
             self.update_members(msg[1])
+
             if msg[0] == State.SEND_ELECTION.value:
-                self.set_state(peer, State.SEND_OK)
+                self.set_state(State.SEND_OK, peer)
                 self.send_msg(peer)
+                #self.selector.modify(peer, selectors.EVENT_WRITE)
+
                 #start an election myself if I'm not in an election
-                if self.listener not in self.states: self.start_election()
+                if not self.election_in_progress: self.start_election()
+
             if msg[0] == State.SEND_VICTORY.value:
                 #FIXME how to extract pid?
                 bullyaddr = peer.getpeername()
@@ -283,11 +296,13 @@ class Lab2(object):
             if msg[0] == State.SEND_OK.value:
                 self.states[self.listener] = State.WAITING_FOR_VICTOR
         finally:
-            print('closing connection to peer: {}'.format(peer.getpeername()) )
             if peer.fileno() > 0 :
+                print('closing connection to peer: {}'.format(peer.getpeername()) )
                 self.selector.unregister(peer)
                 peer.close()
                 print('closed')
+            else:
+                print('connection closed')
 
     def is_expired(self, peer=None, threshold=ASSUME_FAILURE_TIMEOUT):
         pass
