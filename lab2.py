@@ -134,6 +134,7 @@ class Lab2(object):
 
         try:
             print('\n%s to (%s, %i)' % (msg, host, port))
+            s.settimeout(self.ASSUME_FAILURE_TIMEOUT)
             s.connect((host, port))
             return True
         except socket.timeout as e:
@@ -471,15 +472,19 @@ class Lab2(object):
         print('I, {}, won the election woooo\n'.format(self.pid))
          
 if __name__ == '__main__':
-    """ The entry point of the application """
+    """ The entry point of the application 
+    
+    Sample accepted format: python3 lab2.py 08-26-2023 2332738 localhost 7000
+
+    """
 
     if len(sys.argv) != 5:
-        print('Usage: python client.py BIRTHDAY SUID GCD_HOST GCD_PORT')
+        print('Required format: python client.py mm-dd-yyyy SUID GCD_HOST GCD_PORT')
         exit(1)
     
-    nextBirthday = sys.argv[0] #datetime.datetime(2023, 8, 26)
-    SUID = sys.argv[1]
-    gcd_address = (sys.argv[2], sys.argv[3])
+    nextBirthday = datetime.datetime.strptime(sys.argv[1], '%m-%d-%Y')
+    SUID = sys.argv[2]
+    gcd_address = (sys.argv[3], sys.argv[4])
 
     node = Lab2(gcd_address, nextBirthday, SUID)
     node.run()
