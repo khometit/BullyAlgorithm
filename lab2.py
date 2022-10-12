@@ -5,7 +5,6 @@ This is free and unencumbered software released into the public domain.
 :Version: 1.0
 """
 
-from decimal import MIN_EMIN
 from enum import Enum
 import datetime
 import socket
