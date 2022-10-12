@@ -5,6 +5,7 @@ This is free and unencumbered software released into the public domain.
 :Version: 1.0
 """
 
+from decimal import MIN_EMIN
 from enum import Enum
 import datetime
 import socket
@@ -12,6 +13,7 @@ import selectors
 import sys
 import pickle
 import time
+from random import randint as rand
 
 """
 This module is to test an application acting as a node in a distributed system. 
@@ -19,6 +21,14 @@ The algorithm to choose the system's coordinator is the Bully Algorithm.
 The module contains:
 > a State class to sum the needed states to be used during the life time of the node.
 > a Lab2 class that is the actual node
+
+Extra credit attempted: PROBE, FEIGN
+
+Pre-condition: Please start the program in the terminal with this format:
+    python client.py GCD_HOST GCD_PORT mm-dd-yyyy SUID [--probe] [--feign]
+
+    [--probe] is optional
+    [--feign] is optional
 """
 
 class State(Enum):
@@ -41,6 +51,7 @@ class State(Enum):
     WAITING_FOR_VICTOR = 'WHO IS THE WINNER?'  # This one only applies to myself
     WAITING_FOR_ANY_MESSAGE = 'WAITING'  # When I've done an accept on their connect to my server
 
+
     def is_incoming(self):
         """Categorization helper."""
         return self not in (State.SEND_ELECTION, State.SEND_VICTORY, State.SEND_OK)
@@ -55,6 +66,10 @@ class Lab2(object):
     ASSUME_FAILURE_TIMEOUT = 2.5        #Only wait 4 seconds till something else should happen
     SELECTOR_CHECK = 0.3
     days_to_birthday = 0
+    PROBING_THRESHOLD = 0
+    FEIGNING_THRESHOLD = 0
+    PROBE_ENABLED = False
+    FEIGN_ENABLED = False
     
     def __init__(self, gcd_address, nextBirthday, SUID) -> None:
         """Constructs a Lab2 object to talk to the given GCD """
@@ -64,13 +79,24 @@ class Lab2(object):
         self.members = {}
         self.states= {}
         self.bully = None                   #None when no leader, otherwise it'll be the pid of the leader
+        self.probing = False
         self.selector = selectors.DefaultSelector()
         self.listener, self.listener_address = self.start_a_server()
+
+        #For probing
+        self.bully_address = None
+        self.last_heard_bully = []         #Used to store last time heard from bully as Datetime object
+
+        #For feigning
+        self.last_startup_time = []
 
     def run(self):
         """Start up point for the node. It will talk to the GCD to get the list of members, 
         start an election and keep the listening socket active"""
 
+        #Feigned failure at start up
+        if self.FEIGN_ENABLED:
+            self.startFeigning()
 
         #Registering the socket without a callback for this socket
         self.selector.register(self.listener, selectors.EVENT_READ, data=None)
@@ -108,6 +134,13 @@ class Lab2(object):
             self.start_election('Have not received COORDINATOR message')
         elif self.get_state(self) == State.WAITING_FOR_OK and self.is_expired(self):
             self.announce_victory()
+        
+        #Only send the probe message once the wait time is up
+        elif self.PROBE_ENABLED and self.is_to_send_probe():
+            self.sendProbe()
+        elif self.FEIGN_ENABLED and self.is_to_shut_down():
+            self.startFeigning()
+            self.start_election('Node recovered from a shutdown')
 
     def start_a_server(self):
         """Function to start a generic server
@@ -232,6 +265,7 @@ class Lab2(object):
         except Exception as err:
             print('Failure connecting to member {}, {}'.format(member, err))
             s.close()
+            return False
         else:
             self.selector.register(s, selectors.EVENT_WRITE)
             return s 
@@ -249,6 +283,7 @@ class Lab2(object):
 
         print('\n-------- Starting a new election. Reason: {} ------------'.format(reason))
         self.bully = None                                   #Voting in progress
+        self.bully_address = None
         self.set_state(State.WAITING_FOR_OK, self)          #Set myself in waiting for ok first in case I am actually the biggest bully
         im_biggest = True
 
@@ -328,12 +363,12 @@ class Lab2(object):
             print('Failure occured while trying to send message to peer', err) 
         else:
             #Mark that I'm waiting for a response from the nodes I sent election msg to
-            if msg == State.SEND_ELECTION: 
+            if msg == State.SEND_ELECTION or msg == State.SEND_PROBE: 
                 self.set_state(State.WAITING_FOR_OK, peer)
                 self.selector.modify(peer, selectors.EVENT_READ)
         finally:
             #I can close the socket if I'm not expecting any response from the peer afterwards
-            if msg != State.SEND_ELECTION:
+            if msg != State.SEND_ELECTION and msg != State.SEND_PROBE:
                 self.selector.unregister(peer)
                 peer.close()
 
@@ -362,6 +397,10 @@ class Lab2(object):
                 if self.is_election_in_progress() == False: 
                     self.start_election('Received ELECTION from lower pid')
             
+            #Received probe message
+            if msg[0] == State.SEND_PROBE.value:
+                self.set_state(State.SEND_OK, peer)
+            
             #Received coordination message
             if msg[0] == State.SEND_VICTORY.value:
                 #Found a new leader, should wipe everything now
@@ -379,10 +418,14 @@ class Lab2(object):
 
                 #Either way, forget about the peer that sent the message
                 self.set_state(State.QUIESCENT, peer)
+
+                #Special follow up for probing
+                if self.probing:
+                    self.setProbe()
         #just in case 
         finally:
             if peer.fileno() > 0 :
-                print('closing connection to peer: {}'.format(peer.getpeername()) )
+                print('{}: closing connection'.format(self.cpr_sock(peer)) )
                 self.selector.unregister(peer)
                 peer.close()
                 print('closed')
@@ -401,6 +444,10 @@ class Lab2(object):
 
         self.bully = highest
         print('Found new leader: {}'.format(self.bully))
+
+        #Used for Probing
+        self.bully_address = memberList[highest]
+        self.setProbe()
 
     def is_expired(self, peer, threshold=ASSUME_FAILURE_TIMEOUT):
         """Helper function to check if the time has passed the threshold
@@ -470,21 +517,112 @@ class Lab2(object):
         
         self.bully = self.pid
         print('I, {}, won the election woooo\n'.format(self.pid))
-         
+
+    def setProbe(self):
+        """ Helper function to set all the variables related to probing the new found leader"""
+        #Pass when probing is not enabled
+        if self.PROBE_ENABLED == False:
+            pass
+        
+        PROBE_MIN = 500
+        PROBE_MAX = 3000
+        self.probing = False
+         #Start counting down until time to probe the bully
+        self.PROBING_THRESHOLD = rand(PROBE_MIN, PROBE_MAX) / 1000
+        print('Current probing threshold till next probe message: {}'.format(self.PROBING_THRESHOLD))
+        self.last_heard_bully.append(self.stamp())
+
+    def is_to_send_probe(self):
+        """ Helper function to check whether it is time to send out probe messages to our leader 
+        
+        :return: True if we time passed since last heard hits the threshold for waiting. False otherwise"""
+        #Don't try to send probe when there's no leader, or that the leader is self
+        if self.bully == None or self.bully_address == None or self.bully_address == self.listener_address or len(self.last_heard_bully) <= 0:
+            return False
+
+        timepassed = (datetime.datetime.now() - self.last_heard_bully[0]).total_seconds()    #get the time delta in seconds
+        if timepassed > self.PROBING_THRESHOLD:
+            self.last_heard_bully.pop()
+            return True
+        
+        return False
+
+    def sendProbe(self):
+        """ Function to connect and send probe message to the leader. If a connection fail then do mark leader as gone and start an election. """
+        self.probing = True
+
+        leader = self.get_connection(self.bully_address)
+        if leader:
+            #get a non-blocking socket connection to the leader
+            self.set_state(State.SEND_PROBE, leader)
+            #send probe
+            self.send_msg(leader)
+        #Start a new election when leader is down
+        else:
+            self.probing = False
+            self.start_election('Leader became un-responsive')
+
+
+    def is_to_shut_down(self):
+        """ Helper function to check whether it is time to shutdown the server 
+        
+        :return: True if we time passed since last heard hits the threshold for waiting. False otherwise"""
+        #Don't try to send probe when there's no leader, or that the leader is self
+        timepassed = (datetime.datetime.now() - self.last_startup_time[0]).total_seconds()    #get the time delta in seconds
+        if timepassed > self.FEIGNING_THRESHOLD:
+            self.last_startup_time.pop()
+            return True
+        
+        return False
+
+    def restartServer(self):
+        """ Helper function to restart the server at the same address """
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(self.listener_address)
+        self.listener.listen(10)
+        self.listener.setblocking(False)
+        self.last_startup_time.append(self.stamp())
+        print('Restarted server. Listener address: {}'.format(self.listener.getsockname()))
+        
+    def startFeigning(self):
+        """ Function to mimic the situation of a server shutdown """
+        DUR_MIN = 1000
+        DUR_MAX = 4000
+
+        NEXT_MIN = 0
+        NEXT_MAX = 10000
+        duration = rand(DUR_MIN, DUR_MAX)/1000
+        print('Now going to sleep for {} seconds. Listener address: {}'.format(duration, self.listener_address))
+        self.listener.close()
+
+        #Restart the timer for next time
+        self.FEIGNING_THRESHOLD= rand(NEXT_MIN, NEXT_MAX)/1000
+        self.restartServer()
+
+
 if __name__ == '__main__':
     """ The entry point of the application 
     
-    Sample accepted format: python3 lab2.py 08-26-2023 2332738 localhost 7000
+    Sample accepted format: python3 lab2.py localhost 7000 08-26-2023 2332738 --probe
 
     """
 
-    if len(sys.argv) != 5:
-        print('Required format: python client.py mm-dd-yyyy SUID GCD_HOST GCD_PORT')
+    if len(sys.argv) < 5:
+        print('Required format: python lab2.py GCD_HOST GCD_PORT mm-dd-yyyy SUID [--probe] [--feign]')
         exit(1)
-    
-    nextBirthday = datetime.datetime.strptime(sys.argv[1], '%m-%d-%Y')
-    SUID = sys.argv[2]
-    gcd_address = (sys.argv[3], sys.argv[4])
+    gcd_address = (sys.argv[1], sys.argv[2])
+    nextBirthday = datetime.datetime.strptime(sys.argv[3], '%m-%d-%Y')
+    SUID = sys.argv[4]
 
     node = Lab2(gcd_address, nextBirthday, SUID)
+
+    if len(sys.argv) == 6:
+        if sys.argv[5] == '--probe' : Lab2.PROBE_ENABLED = True
+        if sys.argv[5] == '--feign' : Lab2.FEIGN_ENABLED = True
+    
+    if len(sys.argv) == 7:
+        Lab2.PROBE_ENABLED = True
+        Lab2.FEIGN_ENABLED = True
+
+
     node.run()
