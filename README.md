@@ -1,7 +1,7 @@
 # Bully Algorithm
 
 An implementation of nodes in a distributed system trying to coordinate by using the 
-Bully Algorithm to find a common coordinator for the group. 
+Bully Algorithm to find a common coordinator for the group, using socket connection.
 
 Nodes will initiate an election on start-up and/or whenever it notices that the current leader is out of contact.
 > send 'VOTE' messages to processes with higher pids.
